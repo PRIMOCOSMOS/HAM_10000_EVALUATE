@@ -1,10 +1,10 @@
 """
 分类评估指标模块
 计算准确率、召回率、精确率、F1、混淆矩阵等，支持七分类和分组评估。
+新增：nv安全性指标，约束“nv尽量不误诊”的优化方向。
 """
 
 import numpy as np
-from collections import Counter
 
 
 # HAM10000 七分类标签
@@ -22,20 +22,6 @@ ORIGIN_GROUPS = {
 def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
     """
     计算完整的分类评估指标。
-
-    参数:
-        y_true: 真实标签列表
-        y_pred: 预测标签列表
-        classes: 类别列表，默认使用ALL_CLASSES
-
-    返回:
-        dict:
-            accuracy: float, 总体准确率
-            per_class: dict, 每类的precision/recall/f1/support
-            macro_avg: dict, 宏平均precision/recall/f1
-            weighted_avg: dict, 加权平均precision/recall/f1
-            confusion_matrix: np.ndarray, 混淆矩阵
-            origin_accuracy: dict, 按组织来源分组的准确率
     """
     if classes is None:
         classes = ALL_CLASSES
@@ -44,11 +30,9 @@ def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
     if n == 0:
         return _empty_metrics(classes)
 
-    # --- 总体准确率 ---
     correct = sum(1 for t, p in zip(y_true, y_pred) if t == p)
     accuracy = correct / n
 
-    # --- 混淆矩阵 ---
     class_to_idx = {c: i for i, c in enumerate(classes)}
     num_classes = len(classes)
     cm = np.zeros((num_classes, num_classes), dtype=np.int32)
@@ -59,7 +43,6 @@ def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
         if ti is not None and pi is not None:
             cm[ti, pi] += 1
 
-    # --- 每类指标 ---
     per_class = {}
     for i, cls in enumerate(classes):
         tp = cm[i, i]
@@ -78,7 +61,6 @@ def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
             "support": int(support),
         }
 
-    # --- 宏平均 ---
     macro_precision = np.mean([v["precision"] for v in per_class.values()])
     macro_recall = np.mean([v["recall"] for v in per_class.values()])
     macro_f1 = np.mean([v["f1"] for v in per_class.values()])
@@ -89,18 +71,11 @@ def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
         "f1": float(macro_f1),
     }
 
-    # --- 加权平均 ---
     total_support = sum(v["support"] for v in per_class.values())
     if total_support > 0:
-        weighted_precision = sum(
-            v["precision"] * v["support"] for v in per_class.values()
-        ) / total_support
-        weighted_recall = sum(
-            v["recall"] * v["support"] for v in per_class.values()
-        ) / total_support
-        weighted_f1 = sum(
-            v["f1"] * v["support"] for v in per_class.values()
-        ) / total_support
+        weighted_precision = sum(v["precision"] * v["support"] for v in per_class.values()) / total_support
+        weighted_recall = sum(v["recall"] * v["support"] for v in per_class.values()) / total_support
+        weighted_f1 = sum(v["f1"] * v["support"] for v in per_class.values()) / total_support
     else:
         weighted_precision = weighted_recall = weighted_f1 = 0.0
 
@@ -110,8 +85,8 @@ def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
         "f1": float(weighted_f1),
     }
 
-    # --- 按组织来源分组的准确率 ---
     origin_accuracy = _compute_origin_accuracy(y_true, y_pred)
+    safety_metrics = _compute_nv_safety_metrics(y_true, y_pred)
 
     return {
         "accuracy": float(accuracy),
@@ -120,29 +95,23 @@ def compute_metrics(y_true: list, y_pred: list, classes: list = None) -> dict:
         "weighted_avg": weighted_avg,
         "confusion_matrix": cm,
         "origin_accuracy": origin_accuracy,
+        "safety_metrics": safety_metrics,
     }
 
 
 def print_classification_report(metrics: dict, classes: list = None) -> str:
     """
     生成格式化的分类报告字符串。
-
-    参数:
-        metrics: compute_metrics的输出
-        classes: 类别列表
-
-    返回:
-        格式化报告字符串
     """
     if classes is None:
         classes = ALL_CLASSES
 
     lines = []
-    lines.append("=" * 65)
+    lines.append("=" * 70)
     lines.append("HAM10000 BIP Classification Report")
-    lines.append("=" * 65)
+    lines.append("=" * 70)
     lines.append(f"{'Class':<10} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
-    lines.append("-" * 65)
+    lines.append("-" * 70)
 
     per_class = metrics.get("per_class", {})
     for cls in classes:
@@ -154,7 +123,7 @@ def print_classification_report(metrics: dict, classes: list = None) -> str:
             f"{info.get('support', 0):>5}"
         )
 
-    lines.append("-" * 65)
+    lines.append("-" * 70)
     macro = metrics.get("macro_avg", {})
     weighted = metrics.get("weighted_avg", {})
     lines.append(
@@ -167,10 +136,9 @@ def print_classification_report(metrics: dict, classes: list = None) -> str:
         f"{weighted.get('recall', 0):.4f}     "
         f"{weighted.get('f1', 0):.4f}"
     )
-    lines.append("-" * 65)
+    lines.append("-" * 70)
     lines.append(f"Overall Accuracy: {metrics.get('accuracy', 0):.4f}")
 
-    # 组织来源分组准确率
     origin_acc = metrics.get("origin_accuracy", {})
     if origin_acc:
         lines.append("")
@@ -178,14 +146,20 @@ def print_classification_report(metrics: dict, classes: list = None) -> str:
         for group, acc in origin_acc.items():
             lines.append(f"  {group:<15} {acc:.4f}")
 
-    lines.append("=" * 65)
+    safety = metrics.get("safety_metrics", {})
+    if safety:
+        lines.append("")
+        lines.append("NV Safety Metrics:")
+        lines.append(f"  nv_misdiagnosis_rate   {safety.get('nv_misdiagnosis_rate', 0):.4f}")
+        lines.append(f"  nv_to_mel_rate         {safety.get('nv_to_mel_rate', 0):.4f}")
+        lines.append(f"  nv_to_keratin_rate     {safety.get('nv_to_keratin_rate', 0):.4f}")
+        lines.append(f"  nv_to_other_rate       {safety.get('nv_to_other_rate', 0):.4f}")
 
-    report = "\n".join(lines)
-    return report
+    lines.append("=" * 70)
+    return "\n".join(lines)
 
 
 def _compute_origin_accuracy(y_true: list, y_pred: list) -> dict:
-    """计算按组织来源分组的准确率（第1层决策的评估）"""
     def get_origin(label):
         for origin, members in ORIGIN_GROUPS.items():
             if label in members:
@@ -207,6 +181,32 @@ def _compute_origin_accuracy(y_true: list, y_pred: list) -> dict:
     return origin_accuracy
 
 
+def _compute_nv_safety_metrics(y_true: list, y_pred: list) -> dict:
+    nv_idx = [i for i, t in enumerate(y_true) if t == "nv"]
+    n_nv = len(nv_idx)
+    if n_nv == 0:
+        return {
+            "nv_misdiagnosis_rate": 0.0,
+            "nv_to_mel_rate": 0.0,
+            "nv_to_keratin_rate": 0.0,
+            "nv_to_other_rate": 0.0,
+        }
+
+    wrong = [i for i in nv_idx if y_pred[i] != "nv"]
+    nv_misdiagnosis_rate = len(wrong) / n_nv
+
+    nv_to_mel = sum(1 for i in nv_idx if y_pred[i] == "mel") / n_nv
+    nv_to_keratin = sum(1 for i in nv_idx if y_pred[i] in ("bkl", "akiec", "bcc")) / n_nv
+    nv_to_other = sum(1 for i in nv_idx if y_pred[i] in ("vasc", "df")) / n_nv
+
+    return {
+        "nv_misdiagnosis_rate": float(nv_misdiagnosis_rate),
+        "nv_to_mel_rate": float(nv_to_mel),
+        "nv_to_keratin_rate": float(nv_to_keratin),
+        "nv_to_other_rate": float(nv_to_other),
+    }
+
+
 def _empty_metrics(classes):
     return {
         "accuracy": 0.0,
@@ -215,4 +215,10 @@ def _empty_metrics(classes):
         "weighted_avg": {"precision": 0.0, "recall": 0.0, "f1": 0.0},
         "confusion_matrix": np.zeros((len(classes), len(classes)), dtype=np.int32),
         "origin_accuracy": {},
+        "safety_metrics": {
+            "nv_misdiagnosis_rate": 0.0,
+            "nv_to_mel_rate": 0.0,
+            "nv_to_keratin_rate": 0.0,
+            "nv_to_other_rate": 0.0,
+        },
     }

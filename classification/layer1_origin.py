@@ -1,9 +1,6 @@
 """
-第1层决策：组织来源分组（优化版）
-核心改进：
-  1. 增加"melanocytic先验"——当网络得分处于边界区间时，倾向判为melanocytic
-  2. 提高vasc和df的判定门槛，减少假阳性
-  3. 增加"弱网络+对称+少色"的辅助判据
+第1层决策：组织来源分组（重构版）
+目标：减少nv被错误分流到keratinocytic，并保持vasc/df的特异性。
 """
 
 import numpy as np
@@ -20,14 +17,20 @@ def classify_origin(features: dict, thresholds: dict = None) -> dict:
     根据第1层特征判定病变的组织来源。
     """
     t = {
-        "lacunae_score_thresh": 0.45,
-        "lacunae_count_thresh": 3,
-        "df_pattern_score_thresh": 0.45,
-        "df_gradient_thresh": 0.35,
-        "network_score_thresh": 0.25,
-        "network_coverage_thresh": 0.08,
-        # 新增：弱网络的宽松阈值（用于边界情况）
-        "network_score_soft_thresh": 0.15,
+        # 兼容旧阈值字段
+        "lacunae_score_thresh": 0.48,
+        "lacunae_count_thresh": 4,
+        "df_pattern_score_thresh": 0.50,
+        "df_gradient_thresh": 0.38,
+        "network_score_thresh": 0.24,
+        "network_coverage_thresh": 0.07,
+        "network_score_soft_thresh": 0.14,
+
+        # 新逻辑阈值
+        "vascular_evidence_thresh": 0.58,
+        "fibrous_evidence_thresh": 0.56,
+        "melanocytic_evidence_thresh": 0.38,
+        "origin_margin": 0.08,
     }
     if thresholds:
         t.update(thresholds)
@@ -36,89 +39,126 @@ def classify_origin(features: dict, thresholds: dict = None) -> dict:
     lac = features.get("lacunae", {})
     cwp = features.get("central_white_patch", {})
 
-    vasc_score = lac.get("lacunae_score", 0.0)
-    vasc_count = lac.get("lacunae_count", 0)
-    df_score = cwp.get("df_pattern_score", 0.0)
-    df_gradient = cwp.get("radial_gradient", 0.0)
-    has_central_white = cwp.get("has_central_white_patch", False)
-    has_periph_net = cwp.get("has_peripheral_network", False)
-    mel_origin_score = net.get("network_score", 0.0)
-    net_coverage = net.get("coverage", 0.0)
-    gabor_strength = net.get("gabor_strength", 0.0)
+    vasc_score = float(lac.get("lacunae_score", 0.0))
+    vasc_count = int(lac.get("lacunae_count", 0))
+    vasc_color_type = str(lac.get("color_type", "unknown"))
+
+    df_score = float(cwp.get("df_pattern_score", 0.0))
+    df_gradient = float(cwp.get("radial_gradient", 0.0))
+    has_central_white = bool(cwp.get("has_central_white_patch", False))
+    has_periph_net = bool(cwp.get("has_peripheral_network", False))
+
+    mel_origin_score = float(net.get("network_score", 0.0))
+    net_coverage = float(net.get("coverage", 0.0))
+    gabor_strength = float(net.get("gabor_strength", 0.0))
+    has_network = bool(net.get("has_network", False))
+
+    # 证据计算
+    vasc_count_norm = np.clip((vasc_count - 1) / 5.0, 0.0, 1.0)
+    vasc_red_bonus = 0.1 if vasc_color_type in ("red", "red_lacunae", "hemorrhagic") else 0.0
+    vascular_evidence = (
+        0.65 * vasc_score +
+        0.20 * vasc_count_norm +
+        0.15 * vasc_red_bonus
+    )
+
+    fibrous_evidence = (
+        0.45 * df_score +
+        0.15 * np.clip(df_gradient / 0.5, 0.0, 1.0) +
+        0.20 * (1.0 if has_central_white else 0.0) +
+        0.20 * (1.0 if has_periph_net else 0.0)
+    )
+
+    melanocytic_evidence = (
+        0.45 * mel_origin_score +
+        0.20 * np.clip(net_coverage / 0.2, 0.0, 1.0) +
+        0.20 * np.clip(gabor_strength / 0.5, 0.0, 1.0) +
+        0.15 * (1.0 if has_network else 0.0)
+    )
 
     scores = {
-        "vascular": float(vasc_score),
-        "fibrous": float(df_score),
-        "melanocytic": float(mel_origin_score),
+        "vascular": float(np.clip(vascular_evidence, 0.0, 1.0)),
+        "fibrous": float(np.clip(fibrous_evidence, 0.0, 1.0)),
+        "melanocytic": float(np.clip(melanocytic_evidence, 0.0, 1.0)),
         "keratinocytic": 0.0,
     }
 
-    # --- 优先级决策 ---
+    margin = t["origin_margin"]
 
-    # 1. 血管来源（提高门槛）
-    if (vasc_score >= t["lacunae_score_thresh"] and
-            vasc_count >= t["lacunae_count_thresh"]):
-        confidence = min(1.0, vasc_score / 0.7)
+    # 1) vasc: 高特异，要求强证据 + 足够领先
+    if (
+        vascular_evidence >= t["vascular_evidence_thresh"] and
+        vascular_evidence >= fibrous_evidence + margin and
+        vascular_evidence >= melanocytic_evidence + margin and
+        vasc_score >= t["lacunae_score_thresh"] and
+        vasc_count >= t["lacunae_count_thresh"]
+    ):
+        conf = np.clip(0.55 + 0.45 * vascular_evidence, 0.0, 1.0)
         return {
             "origin": ORIGIN_VASCULAR,
-            "confidence": float(confidence),
+            "confidence": float(conf),
             "scores": scores,
-            "reasoning": f"红色腔隙: count={vasc_count}, score={vasc_score:.3f}",
+            "reasoning": f"血管证据强: lacunae_score={vasc_score:.3f}, count={vasc_count}",
         }
 
-    # 2. 纤维来源（提高门槛，需要三个条件同时满足）
-    if (df_score >= t["df_pattern_score_thresh"] and
-            has_central_white and has_periph_net and
-            df_gradient >= t["df_gradient_thresh"]):
-        confidence = min(1.0, df_score / 0.7)
+    # 2) df: 维持高特异条件
+    if (
+        fibrous_evidence >= t["fibrous_evidence_thresh"] and
+        fibrous_evidence >= vascular_evidence + margin and
+        fibrous_evidence >= melanocytic_evidence + margin and
+        df_score >= t["df_pattern_score_thresh"] and
+        has_central_white and has_periph_net and
+        df_gradient >= t["df_gradient_thresh"]
+    ):
+        conf = np.clip(0.55 + 0.45 * fibrous_evidence, 0.0, 1.0)
         return {
             "origin": ORIGIN_FIBROUS,
-            "confidence": float(confidence),
-            "scores": scores,
-            "reasoning": f"中央白斑+周围网络: df_score={df_score:.3f}",
-        }
-
-    # 3. 黑色素细胞来源（降低门槛 + 增加宽松路径）
-    # 主路径：标准阈值
-    if (mel_origin_score >= t["network_score_thresh"] and
-            net_coverage >= t["network_coverage_thresh"]):
-        confidence = min(1.0, mel_origin_score / 0.6)
-        return {
-            "origin": ORIGIN_MELANOCYTIC,
-            "confidence": float(confidence),
+            "confidence": float(conf),
             "scores": scores,
             "reasoning": (
-                f"色素网络: score={mel_origin_score:.3f}, "
-                f"coverage={net_coverage:.3f}"
+                f"纤维证据强: df_score={df_score:.3f}, "
+                f"central_white={int(has_central_white)}, peripheral_net={int(has_periph_net)}"
             ),
         }
 
-    # 宽松路径：弱网络信号但Gabor强度尚可
-    # 很多典型nv的网络淡但确实存在，这里给一个"benefit of doubt"
-    if (mel_origin_score >= t["network_score_soft_thresh"] and
-            gabor_strength > 0.15):
-        # 额外检查：如果同时没有强烈的角质类特征，倾向判为melanocytic
-        # （角质类病变通常完全没有网络信号）
-        if vasc_score < 0.2 and df_score < 0.2:
-            confidence = min(0.7, mel_origin_score / 0.4)
-            return {
-                "origin": ORIGIN_MELANOCYTIC,
-                "confidence": float(confidence),
-                "scores": scores,
-                "reasoning": (
-                    f"弱色素网络(宽松路径): score={mel_origin_score:.3f}, "
-                    f"gabor_strength={gabor_strength:.3f}"
-                ),
-            }
+    # 3) melanocytic：只要有中等网络证据，优先于keratinocytic（防止nv误分流）
+    if (
+        melanocytic_evidence >= t["melanocytic_evidence_thresh"] or
+        (
+            mel_origin_score >= t["network_score_soft_thresh"] and
+            gabor_strength > 0.15 and
+            max(vascular_evidence, fibrous_evidence) < 0.45
+        )
+    ):
+        conf = np.clip(0.45 + 0.45 * melanocytic_evidence, 0.0, 1.0)
+        return {
+            "origin": ORIGIN_MELANOCYTIC,
+            "confidence": float(conf),
+            "scores": scores,
+            "reasoning": (
+                f"黑色素来源证据: network_score={mel_origin_score:.3f}, "
+                f"coverage={net_coverage:.3f}, gabor={gabor_strength:.3f}"
+            ),
+        }
 
-    # 4. 默认：角质形成细胞来源
-    max_other = max(vasc_score, df_score, mel_origin_score)
-    keratinocytic_confidence = 1.0 - min(1.0, max_other / 0.3)
-    scores["keratinocytic"] = float(keratinocytic_confidence)
+    # 4) 歧义区处理：若无明显vasc/df且存在轻度网络线索，仍归melanocytic低置信
+    if melanocytic_evidence > 0.20 and max(vascular_evidence, fibrous_evidence) < 0.35:
+        conf = np.clip(0.35 + 0.30 * melanocytic_evidence, 0.0, 1.0)
+        return {
+            "origin": ORIGIN_MELANOCYTIC,
+            "confidence": float(conf),
+            "scores": scores,
+            "reasoning": "歧义区倾向黑色素来源（弱网络证据存在）",
+        }
+
+    # 5) 默认角质形成细胞组
+    max_other = max(vascular_evidence, fibrous_evidence, melanocytic_evidence)
+    ker_conf = np.clip(0.35 + 0.65 * (1.0 - max_other), 0.0, 1.0)
+    scores["keratinocytic"] = float(ker_conf)
 
     return {
         "origin": ORIGIN_KERATINOCYTIC,
-        "confidence": float(max(0.3, keratinocytic_confidence)),
+        "confidence": float(ker_conf),
         "scores": scores,
-        "reasoning": f"无特异性结构, 归入角质组 (max_other={max_other:.3f})",
+        "reasoning": f"其余来源证据不足，归入角质组 (max_other={max_other:.3f})",
     }

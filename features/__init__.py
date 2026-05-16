@@ -17,3 +17,4 @@ from .surface_texture import compute as compute_surface_texture
 from .arborizing_vessels import compute as compute_arborizing_vessels
 from .ovoid_nests import compute as compute_ovoid_nests
 from .leaf_spoke_structures import compute as compute_leaf_spoke_structures
+from .glcm_texture import compute as compute_glcm_texture

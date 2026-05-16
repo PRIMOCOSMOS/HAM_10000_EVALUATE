@@ -1,162 +1,170 @@
-"""
-完整分类流水线
-串联预处理 → 特征提取 → 三层决策，输出最终诊断和完整报告。
-"""
-
+# classification/pipeline.py
+import time
 import numpy as np
 
 from preprocessing import remove_hair, normalize_color, correct_illumination, segment_lesion
-from features import (
-    compute_pigment_network, compute_lacunae, compute_central_white_patch,
-    compute_symmetry, compute_color_variegation, compute_blue_white_veil,
-    compute_streaks, compute_dots_globules, compute_regression,
-    compute_vascular_pattern, compute_milia_cysts, compute_comedo_openings,
-    compute_fissures_ridges, compute_border_sharpness, compute_strawberry_pattern,
-    compute_surface_texture, compute_arborizing_vessels, compute_ovoid_nests,
-    compute_leaf_spoke_structures,
-)
-from classification.layer1_origin import (
-    classify_origin, ORIGIN_MELANOCYTIC, ORIGIN_VASCULAR, ORIGIN_FIBROUS
-)
+from classification.layer1_origin import classify_origin, ORIGIN_MELANOCYTIC, ORIGIN_VASCULAR, ORIGIN_FIBROUS
 from classification.layer2_melanocytic import classify_melanocytic
 from classification.layer2_keratinocytic import classify_keratinocytic
+from classification.feature_registry import extract_feature_modules, EARLY_MODULES, MEL_EXTRA, KER_EXTRA
+from classification.ml_fusion import load_artifact, predict_probs, rule_to_probs, fuse_probs
+
+
+class _Timer:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.cost = {}
+        self._t0 = None
+        self._name = None
+
+    def start(self, name: str):
+        if not self.enabled:
+            return
+        self._name = name
+        self._t0 = time.perf_counter()
+
+    def stop(self):
+        if not self.enabled or self._name is None:
+            return
+        dt = time.perf_counter() - self._t0
+        self.cost[self._name] = self.cost.get(self._name, 0.0) + dt
+        self._name = None
+        self._t0 = None
+
+    def wrap(self, name: str, fn, *args, **kwargs):
+        self.start(name)
+        out = fn(*args, **kwargs)
+        self.stop()
+        return out
 
 
 def run_pipeline(image_rgb: np.ndarray, config: dict = None) -> dict:
-    """
-    执行完整的HAM10000七分类流水线。
-
-    参数:
-        image_rgb: 原始RGB图像 (H, W, 3), uint8
-        config: 可选配置字典，覆盖默认阈值/参数
-
-    返回:
-        dict:
-            diagnosis: str, 最终诊断 ('nv'/'mel'/'bkl'/'akiec'/'bcc'/'vasc'/'df')
-            confidence: float (0-1)
-            origin: str, 组织来源
-            decision_path: list[str], 决策路径
-            all_features: dict, 所有特征的量化结果
-            layer1_result: dict, 第1层决策详情
-            layer2_result: dict, 第2层决策详情（如适用）
-    """
     if config is None:
         config = {}
 
+    # 新增：是否记录耗时
+    enable_timing = bool(config.get("timing", {}).get("enabled", False))
+    timer = _Timer(enable_timing)
+
     decision_path = []
+    feature_switches = config.get("feature_switches", {})
+    budget = config.get("compute_budget", {})
+    fusion_cfg = config.get("ml_fusion", {})
 
-    # ========== 第0层：预处理 ==========
-    img = remove_hair(image_rgb)
-    img = normalize_color(img)
-    img = correct_illumination(img)
-    seg_result = segment_lesion(img)
+    img = timer.wrap("preprocess.remove_hair", remove_hair, image_rgb)
+    img = timer.wrap("preprocess.normalize_color", normalize_color, img)
+    img = timer.wrap("preprocess.correct_illumination", correct_illumination, img)
+
+    seg_result = timer.wrap("preprocess.segment_lesion", segment_lesion, img)
     mask = seg_result["mask"]
+    seg_quality = float(seg_result.get("quality_score", 1.0))
+    decision_path.append(f"[L0] seg_quality={seg_quality:.2f}")
 
-    decision_path.append(f"[L0] 预处理完成, 病灶面积={seg_result['area']}px")
-
-    # ========== 第1层特征提取 ==========
-    feat_network = compute_pigment_network(img, mask)
-    feat_lacunae = compute_lacunae(img, mask)
-    feat_cwp = compute_central_white_patch(img, mask)
+    # Stage-A early
+    timer.start("feature.extract_early")
+    all_features, extracted_a = extract_feature_modules(img, mask, EARLY_MODULES, feature_switches)
+    timer.stop()
 
     l1_features = {
-        "pigment_network": feat_network,
-        "lacunae": feat_lacunae,
-        "central_white_patch": feat_cwp,
+        "pigment_network": all_features.get("pigment_network", {}),
+        "lacunae": all_features.get("lacunae", {}),
+        "central_white_patch": all_features.get("central_white_patch", {}),
     }
 
-    # ========== 第1层决策 ==========
-    l1_result = classify_origin(l1_features, thresholds=config.get("layer1_thresholds"))
+    l1_result = timer.wrap("cls.layer1_origin", classify_origin, l1_features, config.get("layer1_thresholds"))
     origin = l1_result["origin"]
-    decision_path.append(
-        f"[L1] 组织来源={origin} (confidence={l1_result['confidence']:.2f}): "
-        f"{l1_result['reasoning']}"
-    )
 
-    # ========== 第2层特征提取与决策 ==========
-    l2_result = None
-    all_features = dict(l1_features)
+    artifact = timer.wrap("ml.load_artifact", load_artifact, fusion_cfg.get("artifact_path", ""))
+    early_probs = None
+    if fusion_cfg.get("use_early_model", True):
+        early_probs = timer.wrap("ml.predict_early", predict_probs, artifact, all_features, "early")
 
-    if origin == ORIGIN_VASCULAR:
-        diagnosis = "vasc"
-        confidence = l1_result["confidence"]
-        decision_path.append("[L2] 血管来源 → vasc (无需组内细分)")
-
-    elif origin == ORIGIN_FIBROUS:
-        diagnosis = "df"
-        confidence = l1_result["confidence"]
-        decision_path.append("[L2] 纤维来源 → df (无需组内细分)")
-
-    elif origin == ORIGIN_MELANOCYTIC:
-        feat_sym = compute_symmetry(img, mask)
-        feat_color = compute_color_variegation(img, mask)
-        feat_bwv = compute_blue_white_veil(img, mask)
-        feat_streaks = compute_streaks(img, mask)
-        feat_dots = compute_dots_globules(img, mask)
-        feat_reg = compute_regression(img, mask)
-        feat_vasc = compute_vascular_pattern(img, mask)
-
-        l2_features = {
-            "pigment_network": feat_network,
-            "symmetry": feat_sym,
-            "color_variegation": feat_color,
-            "blue_white_veil": feat_bwv,
-            "streaks": feat_streaks,
-            "dots_globules": feat_dots,
-            "regression": feat_reg,
-            "vascular_pattern": feat_vasc,
-        }
-        all_features.update(l2_features)
-
-        l2_result = classify_melanocytic(
-            l2_features, thresholds=config.get("layer2_mel_thresholds")
-        )
-        diagnosis = l2_result["diagnosis"]
-        confidence = l2_result["confidence"]
-        decision_path.append(f"[L2] 黑色素细胞组: {l2_result['reasoning']}")
-
+    # Stage-B high-cost selective
+    need_high = True
+    if budget.get("extract_high_cost_when_uncertain_only", True):
+        conf_ref = max(early_probs.values()) if early_probs else l1_result["confidence"]
+        need_high = conf_ref < float(budget.get("uncertainty_threshold", 0.62))
     else:
-        # 角质形成细胞组
-        feat_milia = compute_milia_cysts(img, mask)
-        feat_comedo = compute_comedo_openings(img, mask)
-        feat_fissures = compute_fissures_ridges(img, mask)
-        feat_border = compute_border_sharpness(img, mask)
-        feat_strawberry = compute_strawberry_pattern(img, mask)
-        feat_texture = compute_surface_texture(img, mask)
-        feat_vasc = compute_vascular_pattern(img, mask)
-        feat_arbor = compute_arborizing_vessels(img, mask)
-        feat_nests = compute_ovoid_nests(img, mask)
-        feat_leaf = compute_leaf_spoke_structures(img, mask)
-        feat_bwv = compute_blue_white_veil(img, mask)
+        need_high = False
 
-        l2_features = {
-            "milia_cysts": feat_milia,
-            "comedo_openings": feat_comedo,
-            "fissures_ridges": feat_fissures,
-            "border_sharpness": feat_border,
-            "strawberry_pattern": feat_strawberry,
-            "surface_texture": feat_texture,
-            "vascular_pattern": feat_vasc,
-            "arborizing_vessels": feat_arbor,
-            "ovoid_nests": feat_nests,
-            "leaf_spoke_structures": feat_leaf,
-            "blue_white_veil": feat_bwv,
-        }
-        all_features.update(l2_features)
+    extra_modules = []
+    if origin == ORIGIN_MELANOCYTIC:
+        extra_modules = MEL_EXTRA
+    elif origin not in (ORIGIN_VASCULAR, ORIGIN_FIBROUS):
+        extra_modules = KER_EXTRA
 
-        l2_result = classify_keratinocytic(
-            l2_features, weights=config.get("layer2_kerat_weights")
+    if need_high:
+        timer.start("feature.extract_high")
+        all_features, extracted_b = extract_feature_modules(
+            img, mask, extra_modules, feature_switches, existing=all_features
         )
-        diagnosis = l2_result["diagnosis"]
-        confidence = l2_result["confidence"]
-        decision_path.append(f"[L2] 角质形成细胞组: {l2_result['reasoning']}")
+        timer.stop()
+    else:
+        extracted_b = []
 
-    return {
-        "diagnosis": diagnosis,
-        "confidence": float(confidence),
+    # Stage-C rules
+    l2_result = None
+    if origin == ORIGIN_VASCULAR:
+        rule_diag, rule_conf = "vasc", l1_result["confidence"]
+    elif origin == ORIGIN_FIBROUS:
+        rule_diag, rule_conf = "df", l1_result["confidence"]
+    elif origin == ORIGIN_MELANOCYTIC:
+        mel_features = {
+            "pigment_network": all_features.get("pigment_network", {}),
+            "symmetry": all_features.get("symmetry", {}),
+            "color_variegation": all_features.get("color_variegation", {}),
+            "blue_white_veil": all_features.get("blue_white_veil", {}),
+            "streaks": all_features.get("streaks", {}),
+            "dots_globules": all_features.get("dots_globules", {}),
+            "regression": all_features.get("regression", {}),
+            "vascular_pattern": all_features.get("vascular_pattern", {}),
+            "glcm_texture": all_features.get("glcm_texture", {}),
+        }
+        l2_result = timer.wrap("cls.layer2_melanocytic", classify_melanocytic, mel_features, config.get("layer2_mel_thresholds"))
+        rule_diag, rule_conf = l2_result["diagnosis"], l2_result["confidence"]
+    else:
+        ker_features = {
+            "milia_cysts": all_features.get("milia_cysts", {}),
+            "comedo_openings": all_features.get("comedo_openings", {}),
+            "fissures_ridges": all_features.get("fissures_ridges", {}),
+            "border_sharpness": all_features.get("border_sharpness", {}),
+            "strawberry_pattern": all_features.get("strawberry_pattern", {}),
+            "surface_texture": all_features.get("surface_texture", {}),
+            "vascular_pattern": all_features.get("vascular_pattern", {}),
+            "arborizing_vessels": all_features.get("arborizing_vessels", {}),
+            "ovoid_nests": all_features.get("ovoid_nests", {}),
+            "leaf_spoke_structures": all_features.get("leaf_spoke_structures", {}),
+            "blue_white_veil": all_features.get("blue_white_veil", {}),
+        }
+        l2_result = timer.wrap("cls.layer2_keratinocytic", classify_keratinocytic, ker_features, config.get("layer2_kerat_weights"))
+        rule_diag, rule_conf = l2_result["diagnosis"], l2_result["confidence"]
+
+    # Stage-D fusion
+    final_probs = None
+    if fusion_cfg.get("use_final_model", True):
+        final_probs = timer.wrap("ml.predict_final", predict_probs, artifact, all_features, "final")
+
+    rule_probs = timer.wrap("ml.rule_to_probs", rule_to_probs, rule_diag, rule_conf)
+    final_diag, final_conf, fused_probs = timer.wrap("ml.fuse_probs", fuse_probs, rule_probs, early_probs, final_probs, fusion_cfg)
+
+    if seg_quality < 0.25:
+        final_conf *= 0.78
+
+    result = {
+        "diagnosis": final_diag,
+        "confidence": float(np.clip(final_conf, 0.0, 1.0)),
         "origin": origin,
         "decision_path": decision_path,
         "all_features": all_features,
         "layer1_result": l1_result,
         "layer2_result": l2_result,
+        "class_probs": fused_probs,
     }
+
+    if enable_timing:
+        # 总耗时
+        total = sum(timer.cost.values())
+        timer.cost["pipeline.total"] = total
+        result["timing"] = timer.cost
+
+    return result
