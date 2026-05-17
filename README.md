@@ -1,52 +1,60 @@
-# HAM10000_EVALUATE (ICICT 2024 Reproduction)
+# HAM10000_EVALUATE Refactored
 
-本仓库为以下论文的工程化复现实验代码，聚焦传统机器学习路线，并针对 HAM10000 七分类任务实现可复用、可扩展、可缓存的实验流水线：
+This refactor removes the legacy multi-model benchmark flow and implements one medically interpretable pipeline aligned with your proposed method:
 
-- Random Forest
-- K-Nearest Neighbors (KNN)
-- SVM (Polynomial Kernel)
-- 数据不平衡处理：SMOTE、SMOTE-ENN
+1. Hair artifact removal: black-hat morphology + inpainting
+2. Illumination correction: CLAHE on LAB L-channel
+3. Lesion segmentation: Chan-Vese active contour
+4. Feature engineering:
+   - True MREMD decomposition (fixed-window envelopes, multi-resolution down/up sampling) and BIMF1
+   - LBP on ROI and BIMF1 (256 + 256 = 512 texture features)
+   - GLCM texture statistics
+   - HSV histogram over lesion mask
+   - ABCD clinical priors
+5. Class imbalance handling: paper-balanced subset / none / SMOTE / SMOTE-ENN
+6. Classification: StandardScaler + RBF-SVM or ANN (MLP)
 
-## 1. 复现目标
+## Core Configs
 
-对论文中强调的方法进行端到端复现：
+All required experiment controls are centralized in `ham_pipeline/config.py` and used directly in runtime logic:
 
-1. 基于 HAM10000 元数据和图像构建监督学习数据集
-2. 提取可复现实用的手工统计特征（颜色 + 纹理）
-3. 对比三种采样策略：`none` / `smote` / `smoteenn`
-4. 对比三类模型：`random_forest` / `knn` / `svm_poly`
-5. 统一导出 accuracy、precision、recall、F1、混淆矩阵与排行榜
+1. Preprocessing on/off:
+   - `preprocessing_enabled`
+   - `enable_hair_removal`
+   - `enable_clahe`
+2. Feature participation:
+   - `include_lbp_roi`, `include_lbp_bimf1`, `include_glcm`, `include_hsv`, `include_abcd`
+3. Imbalance strategy:
+   - `imbalance_strategy`: `paper_balanced_subset | none | smote | smoteenn`
+4. Classifier choice:
+   - `model_name`: `svm | ann`
+5. Train/validation split:
+   - `split_mode`: `paper_fixed_count | stratified_ratio`
+   - `val_ratio` (used in `stratified_ratio`)
+   - `per_class_limit`, `train_per_class`, `val_per_class` (used in `paper_fixed_count`)
 
-## 2. 目录结构
+## Structure
 
 ```text
-.
+HAM_10000_EVALUATE_refactored/
 ├── main.py
-├── config.py
 ├── requirements.txt
-├── README.md
-└── reproducer/
+└── ham_pipeline/
     ├── __init__.py
-    ├── cache.py
+    ├── config.py
     ├── data.py
-    ├── experiment.py
+    ├── preprocess.py
+    ├── segment.py
     ├── features.py
-    ├── metrics.py
-    ├── models.py
-    └── sampling.py
+    ├── balancing.py
+    ├── model.py
+    ├── evaluate.py
+    └── trainer.py
 ```
 
-## 3. 环境安装
+## Dataset layout
 
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-## 4. 数据准备
-
-确保 `--dataset-root` 目录下至少包含：
+Expected under `--dataset-root`:
 
 ```text
 HAM10000_metadata.csv
@@ -54,62 +62,122 @@ HAM10000_images_part_1/
 HAM10000_images_part_2/
 ```
 
-程序会按 `image_id.jpg` 自动在以上目录中查找图像。
-
-## 5. 运行方式
+## Run
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
 python main.py \
   --dataset-root /path/to/HAM10000 \
   --output-dir artifacts \
-  --image-size 96 \
-  --test-size 0.2 \
+  --image-size 160 \
+  --split-mode paper_fixed_count \
+  --per-class-limit 115 \
+  --train-per-class 70 \
+  --val-per-class 45 \
+  --imbalance-strategy paper_balanced_subset \
+  --model svm \
+  --svm-c 6.0 \
+  --svm-gamma scale \
   --random-state 42 \
   --n-jobs -1
 ```
 
-## 6. 输出结果
+Optional feature switches:
 
-运行后在 `artifacts/` 下生成：
+- `--disable-glcm`
+- `--disable-hsv`
+- `--disable-abcd`
+- `--disable-lbp-roi`
+- `--disable-lbp-bimf1`
 
-1. `class_distribution_original.csv`
-2. `class_distribution_none.csv` / `class_distribution_smote.csv` / `class_distribution_smoteenn.csv`
-3. `leaderboard.csv`
-4. 每组实验目录：`artifacts/<sampling>/<model>/`
+Imbalance options:
 
-每组实验目录内包含：
+- `--imbalance-strategy paper_balanced_subset`
+- `--imbalance-strategy none`
+- `--imbalance-strategy smote`
+- `--imbalance-strategy smoteenn`
 
-1. `metrics.json`
-2. `confusion_matrix.png`
-3. `model.joblib`
+Model options:
 
-## 7. 性能设计
+- `--model svm`
+- `--model ann --ann-hidden 256,128 --ann-alpha 1e-4 --ann-max-iter 400`
 
-为延续原仓库对性能优化的思路，本实现保留并强化了两类机制：
+Paper-style replication preset:
 
-1. 并行：`joblib.Parallel` 对图像特征提取并行执行
-2. 缓存：
-   - 特征缓存（`features_*.npz` / `labels_*.npy`）
-   - 采样缓存（`joblib.Memory`）避免重复 SMOTE/SMOTE-ENN 计算
+- `--paper-mode`
 
-## 8. 注意事项
+This preset enforces: no hair removal, no CLAHE, only ROI/BIMF1 LBP features, balanced 115/class with 70/45 split, ANN classifier, and no SMOTE.
 
-1. 本仓库为论文复现工程，不包含医疗用途声明下的临床决策能力。
-2. 最终指标受随机种子、硬件、图像解码环境和依赖版本影响。
-3. 若你变更特征提取逻辑，建议清理 `artifacts/.cache/` 后重跑。
+Ratio split example:
 
-## 9. 参考文献
-
-1. S. S. K., et al., "Analysis of Skin Lesion Classification using Computational Models," 2024 IEEE International Conference on Inventive Computation Technologies (ICICT), 2024.
-2. DOI: [10.1109/ICICT60155.2024.10673538](https://doi.org/10.1109/ICICT60155.2024.10673538)
-
-建议引用格式（BibTeX，可按 IEEE Xplore 实际条目补全作者字段）：
-
-```bibtex
-@inproceedings{icict2024_skin_lesion_models,
-  title={Analysis of Skin Lesion Classification using Computational Models},
-  booktitle={2024 IEEE International Conference on Inventive Computation Technologies (ICICT)},
-  year={2024},
-  doi={10.1109/ICICT60155.2024.10673538}
-}
+```bash
+python main.py \
+  --dataset-root /path/to/HAM10000 \
+  --output-dir artifacts_ratio \
+  --split-mode stratified_ratio \
+  --val-ratio 0.2 \
+  --imbalance-strategy smoteenn \
+  --model svm
 ```
+
+Balanced-subset coverage over full HAM10000 (round-robin by class subset):
+
+```bash
+python main.py \
+  --dataset-root /path/to/HAM10000 \
+  --output-dir artifacts_coverage \
+  --split-mode paper_fixed_count \
+  --per-class-limit 115 \
+  --train-per-class 70 \
+  --val-per-class 45 \
+  --imbalance-strategy paper_balanced_subset \
+  --model ann \
+  --coverage-enabled \
+  --coverage-max-rounds 0
+```
+
+`coverage-max-rounds=0` means auto rounds until majority-class samples are covered.
+
+Enable posterior probabilities from SVM:
+
+- `--svm-probability`
+
+Note: when `--svm-probability` is enabled, SVC fits an extra Platt scaling stage, which increases training time and memory but allows `predict_proba` during inference.
+
+## Inference
+
+```bash
+python predict.py \
+  --artifacts-dir artifacts \
+  --image-path /path/to/sample.jpg
+```
+
+## Outputs
+
+- `artifacts/metrics.json`
+- `artifacts/confusion_matrix.png`
+- `artifacts/classification_report.csv`
+- `artifacts/model.joblib`
+- `artifacts/feature_columns.json`
+- `artifacts/label_classes.json` (when `--model ann`)
+- `artifacts/class_distribution_train.csv`
+- `artifacts/class_distribution_val.csv`
+- `artifacts/run_config.json`
+
+Coverage mode extra outputs (`coverage_enabled=true`):
+
+- `artifacts/round_*/` per-round metrics and models
+- `artifacts/coverage_metrics.csv`
+- `artifacts/coverage_summary.json`
+
+## Notes
+
+- There is no widely adopted Python package that exposes the exact Samsudin-style MREMD procedure directly; this repo implements that paper flow explicitly in `ham_pipeline/features.py`.
+- BIMF1 extraction follows the MREMD flow with fixed-window extrema envelopes and multiresolution downsampling/upsampling.
+- The default split follows the paper-style balanced protocol (70 train + 45 validation per class from up to 115 samples per class).
+- `paper_balanced_subset` follows the original paper's class-balancing spirit (equalized per-class subset before training).
+- If your accuracy is low on full-dataset settings, try `--paper-mode` first, then add extra feature groups one-by-one to check if they hurt performance.
+- This repository is for research and reproducibility, not clinical deployment.
