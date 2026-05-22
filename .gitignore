@@ -125,7 +125,7 @@ dmypy.json
 *.onnx
 
 # 数据文件（根据项目需要调整）
-/HAM10000
+/HAM10000*
 /artifacts*
 # *.csv
 # *.json

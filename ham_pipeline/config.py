@@ -45,10 +45,9 @@ class PipelineConfig:
 
     smote_k_neighbors: int = 5
     enn_k_neighbors: int = 3
-    # Imbalance strategy: paper_balanced_subset / none / smote / smoteenn
     imbalance_strategy: str = "paper_balanced_subset"
 
-    model_name: str = "svm"  # one of: svm, ann
+    model_name: str = "svm"
     svm_c: float = 6.0
     svm_gamma: str = "scale"
     svm_probability: bool = False
@@ -57,17 +56,24 @@ class PipelineConfig:
     ann_alpha: float = 1e-4
     ann_max_iter: int = 400
 
-    # Split mode: paper_fixed_count (original paper style) / stratified_ratio.
     split_mode: str = "paper_fixed_count"
-
-    # Paper-style balanced subset options.
     per_class_limit: int | None = 115
     train_per_class: int = 70
     val_per_class: int = 45
 
-    # Balanced-subset coverage mode: iterate class-balanced subsets until majority-class samples are covered.
     coverage_enabled: bool = False
-    coverage_max_rounds: int = 0  # 0 means auto (full coverage by subset size)
+    coverage_max_rounds: int = 0
+
+    # Improvement options
+    two_stage_enabled: bool = False
+    stage1_imbalance_strategy: str = "smote"
+    stage2_imbalance_strategy: str = "smoteenn"
+    threshold_tuning_enabled: bool = True
+    threshold_search_min: float = 0.05
+    threshold_search_max: float = 0.95
+    threshold_search_steps: int = 37
+    minority_recall_floor: float = 0.2
+    minority_classes: tuple[str, ...] = ("akiec", "bcc", "df", "mel", "vasc")
 
     def metadata_csv(self) -> Path:
         return self.dataset_root / "HAM10000_metadata.csv"

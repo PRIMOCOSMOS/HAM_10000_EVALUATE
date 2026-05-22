@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
+    balanced_accuracy_score,
     classification_report,
     confusion_matrix,
     f1_score,
@@ -21,24 +22,27 @@ def evaluate_and_save(
     y_pred: np.ndarray,
     labels: list[str],
     output_dir: Path,
+    prefix: str = "",
 ) -> dict[str, float]:
     output_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{prefix}_" if prefix else ""
 
     metrics = {
         "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
         "precision_macro": float(precision_score(y_true, y_pred, average="macro", zero_division=0)),
         "recall_macro": float(recall_score(y_true, y_pred, average="macro", zero_division=0)),
         "f1_macro": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
     }
 
-    with (output_dir / "metrics.json").open("w", encoding="utf-8") as f:
+    with (output_dir / f"{name}metrics.json").open("w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
     report = classification_report(y_true, y_pred, labels=labels, output_dict=True, zero_division=0)
-    pd.DataFrame(report).transpose().to_csv(output_dir / "classification_report.csv", index=True)
+    pd.DataFrame(report).transpose().to_csv(output_dir / f"{name}classification_report.csv", index=True)
 
     cm = confusion_matrix(y_true, y_pred, labels=labels)
-    _plot_confusion_matrix(cm, labels, output_dir / "confusion_matrix.png")
+    _plot_confusion_matrix(cm, labels, output_dir / f"{name}confusion_matrix.png")
     return metrics
 
 

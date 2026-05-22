@@ -40,19 +40,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ann-hidden", type=str, default="256,128")
     parser.add_argument("--ann-alpha", type=float, default=1e-4)
     parser.add_argument("--ann-max-iter", type=int, default=400)
-    parser.add_argument("--split-mode", type=str, default="paper_fixed_count", choices=["paper_fixed_count", "stratified_ratio"])
+    parser.add_argument(
+        "--split-mode",
+        type=str,
+        default="paper_fixed_count",
+        choices=["paper_fixed_count", "stratified_ratio"],
+    )
     parser.add_argument("--per-class-limit", type=int, default=115)
     parser.add_argument("--train-per-class", type=int, default=70)
     parser.add_argument("--val-per-class", type=int, default=45)
     parser.add_argument("--coverage-enabled", action="store_true")
     parser.add_argument("--coverage-max-rounds", type=int, default=0)
     parser.add_argument("--paper-mode", action="store_true")
+
+    # Improvement switches (backward compatible; default off)
+    parser.add_argument("--two-stage", action="store_true")
+    parser.add_argument(
+        "--stage1-imbalance-strategy",
+        type=str,
+        default="smote",
+        choices=["none", "smote", "smoteenn"],
+    )
+    parser.add_argument(
+        "--stage2-imbalance-strategy",
+        type=str,
+        default="smoteenn",
+        choices=["none", "smote", "smoteenn"],
+    )
+    parser.add_argument("--disable-threshold-tuning", action="store_true")
+    parser.add_argument("--threshold-min", type=float, default=0.05)
+    parser.add_argument("--threshold-max", type=float, default=0.95)
+    parser.add_argument("--threshold-steps", type=int, default=37)
+    parser.add_argument("--minority-recall-floor", type=float, default=0.2)
+    parser.add_argument("--minority-classes", type=str, default="akiec,bcc,df,mel,vasc")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     ann_hidden = tuple(int(x.strip()) for x in args.ann_hidden.split(",") if x.strip())
+    minority_classes = tuple(x.strip() for x in args.minority_classes.split(",") if x.strip())
 
     config = PipelineConfig(
         dataset_root=args.dataset_root,
@@ -88,11 +115,18 @@ def main() -> None:
         val_per_class=args.val_per_class,
         coverage_enabled=args.coverage_enabled,
         coverage_max_rounds=args.coverage_max_rounds,
+        two_stage_enabled=args.two_stage,
+        stage1_imbalance_strategy=args.stage1_imbalance_strategy,
+        stage2_imbalance_strategy=args.stage2_imbalance_strategy,
+        threshold_tuning_enabled=not args.disable_threshold_tuning,
+        threshold_search_min=args.threshold_min,
+        threshold_search_max=args.threshold_max,
+        threshold_search_steps=args.threshold_steps,
+        minority_recall_floor=args.minority_recall_floor,
+        minority_classes=minority_classes,
     )
 
     if args.paper_mode:
-        # Aligns with Samsudin et al. protocol: no preprocessing, ROI/BIMF1 LBP only,
-        # balanced 115/class and ANN classifier without SMOTE.
         config.enable_hair_removal = False
         config.enable_clahe = False
         config.include_lbp_roi = True
@@ -109,6 +143,7 @@ def main() -> None:
         config.model_name = "ann"
         config.coverage_enabled = False
         config.coverage_max_rounds = 0
+        config.two_stage_enabled = False
 
     run_training(config)
 

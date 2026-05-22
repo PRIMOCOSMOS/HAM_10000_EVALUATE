@@ -17,7 +17,8 @@ from .config import PipelineConfig
 from .data import build_balanced_coverage_rounds, load_metadata, train_test_split_df
 from .evaluate import evaluate_and_save
 from .features import build_feature_columns, extract_features_for_row
-from .model import build_classifier
+from .model import TwoStageModel, build_classifier, fit_two_stage_model, predict_proba_two_stage
+from .thresholds import predict_with_thresholds, search_thresholds
 
 
 def _extract_matrix(df: pd.DataFrame, config: PipelineConfig) -> np.ndarray:
@@ -33,7 +34,7 @@ def _extract_matrix(df: pd.DataFrame, config: PipelineConfig) -> np.ndarray:
     return np.vstack(feats).astype(np.float32)
 
 
-def _fit_and_predict(
+def _fit_single_stage(
     config: PipelineConfig,
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -56,6 +57,48 @@ def _fit_and_predict(
     return model, y_pred, label_classes
 
 
+def _fit_and_predict(
+    config: PipelineConfig,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    labels: list[str],
+    output_dir: Path,
+) -> tuple[object, np.ndarray, dict[str, float]]:
+    if not config.two_stage_enabled:
+        X_train_bal, y_train_bal = apply_sampling(X_train, y_train, config)
+        model, y_pred, _ = _fit_single_stage(config, X_train_bal, y_train_bal, X_val)
+        metrics = evaluate_and_save(y_val, y_pred, labels, output_dir)
+        return model, y_pred, metrics
+
+    model = fit_two_stage_model(config, X_train, y_train)
+    probs = predict_proba_two_stage(model, X_val, labels)
+    y_argmax = np.array([labels[i] for i in np.argmax(probs, axis=1)], dtype=object)
+    argmax_metrics = evaluate_and_save(y_val, y_argmax, labels, output_dir, prefix="argmax")
+
+    if not config.threshold_tuning_enabled:
+        return model, y_argmax, argmax_metrics
+
+    thresholds = search_thresholds(
+        y_true=y_val,
+        probs=probs,
+        labels=labels,
+        minority_classes=config.minority_classes,
+        recall_floor=config.minority_recall_floor,
+        lo=config.threshold_search_min,
+        hi=config.threshold_search_max,
+        steps=config.threshold_search_steps,
+    )
+    y_thresholded = predict_with_thresholds(probs, labels, thresholds)
+    tuned_metrics = evaluate_and_save(y_val, y_thresholded, labels, output_dir, prefix="thresholded")
+
+    with (output_dir / "thresholds.json").open("w", encoding="utf-8") as f:
+        json.dump(thresholds, f, ensure_ascii=False, indent=2)
+
+    return model, y_thresholded, tuned_metrics
+
+
 def _run_single_experiment(
     config: PipelineConfig,
     train_df: pd.DataFrame,
@@ -75,18 +118,18 @@ def _run_single_experiment(
     y_train = train_df["dx"].to_numpy()
     y_val = val_df["dx"].to_numpy()
 
-    X_train_bal, y_train_bal = apply_sampling(X_train, y_train, config)
-    model, y_pred, label_classes = _fit_and_predict(config, X_train_bal, y_train_bal, X_val)
-
     labels = sorted(pd.concat([train_df["dx"], val_df["dx"]], axis=0).unique().tolist())
-    metrics = evaluate_and_save(y_val, y_pred, labels, output_dir)
+    model, y_pred, metrics = _fit_and_predict(config, X_train, y_train, X_val, y_val, labels, output_dir)
 
     joblib.dump(model, output_dir / "model.joblib")
     with (output_dir / "feature_columns.json").open("w", encoding="utf-8") as f:
         json.dump(feature_columns, f, ensure_ascii=False, indent=2)
-    if label_classes is not None:
+
+    # ANN label encoder classes are still useful for inference compatibility.
+    if config.model_name == "ann" and not config.two_stage_enabled:
+        label_encoder = LabelEncoder().fit(y_train)
         with (output_dir / "label_classes.json").open("w", encoding="utf-8") as f:
-            json.dump(label_classes, f, ensure_ascii=False, indent=2)
+            json.dump(label_encoder.classes_.tolist(), f, ensure_ascii=False, indent=2)
 
     return metrics
 
@@ -99,6 +142,10 @@ def run_training(config: PipelineConfig) -> None:
         raise ValueError("At least one feature group must be enabled.")
     if config.split_mode == "stratified_ratio" and not (0.0 < config.val_ratio < 1.0):
         raise ValueError("val_ratio must be in (0, 1) when split_mode='stratified_ratio'.")
+    if config.two_stage_enabled and config.model_name != "svm":
+        raise ValueError("two_stage_enabled currently supports --model svm only.")
+    if config.coverage_enabled and config.two_stage_enabled:
+        raise ValueError("coverage_enabled + two_stage_enabled is not supported in this patch.")
 
     df = load_metadata(config)
 
@@ -111,9 +158,12 @@ def run_training(config: PipelineConfig) -> None:
 
         print("Training complete")
         print(f"Validation accuracy: {metrics['accuracy']:.4f}")
+        if "balanced_accuracy" in metrics:
+            print(f"Validation balanced_accuracy: {metrics['balanced_accuracy']:.4f}")
+        print(f"Validation f1_macro: {metrics['f1_macro']:.4f}")
         return
 
-    # Coverage mode: iterate balanced subsets until majority class samples are covered.
+    # Keep legacy coverage behavior for baseline mode only.
     round_dfs = build_balanced_coverage_rounds(config, df)
     if not round_dfs:
         raise ValueError("Coverage mode produced zero rounds.")
@@ -151,7 +201,7 @@ def run_training(config: PipelineConfig) -> None:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     if best_round_dir is not None:
-        for name in ["model.joblib", "feature_columns.json", "run_config.json", "label_classes.json"]:
+        for name in ["model.joblib", "feature_columns.json", "run_config.json", "label_classes.json", "thresholds.json"]:
             src = best_round_dir / name
             if src.exists():
                 shutil.copy2(src, output_dir / name)
