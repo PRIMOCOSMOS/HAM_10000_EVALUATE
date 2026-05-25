@@ -1,39 +1,40 @@
 # HAM10000_EVALUATE Refactored
 
-This refactor removes the legacy multi-model benchmark flow and implements one medically interpretable pipeline aligned with your proposed method:
+本项目内容旨在使用传统方法完成HAM10000数据集的七分类任务，主要方法是使用BIP中的各类特征并进行轻量的机器学习分类.
 
-1. Hair artifact removal: black-hat morphology + inpainting
-2. Illumination correction: CLAHE on LAB L-channel
-3. Lesion segmentation: Chan-Vese active contour
-4. Feature engineering:
-   - True MREMD decomposition (fixed-window envelopes, multi-resolution down/up sampling) and BIMF1
-   - LBP on ROI and BIMF1 (256 + 256 = 512 texture features)
-   - GLCM texture statistics
-   - HSV histogram over lesion mask
-   - ABCD clinical priors
-5. Class imbalance handling: paper-balanced subset / none / SMOTE / SMOTE-ENN
-6. Classification: StandardScaler + RBF-SVM or ANN (MLP)
+## Main Pipeline
 
-## Core Configs
+1. 预处理阶段：本项目内置了Black-hat形态学变换去毛发的算法，并通过CLAHE处理对比度、光照问题；但也可以直接通过参数设置，
+跳过预处理，直接使用Enhanced数据（按照分工的原则），处理见前一位同学的工作；ROI根据普遍研究中使用的方法，使用Chan-Vese active contour.
+2. 特征阶段：本项目使用了众多的图像的特征，并将其结果视作向量进行拼接，从而构造多特征联合分类任务；
+3. 分类任务：利用机器学习进行分类，主要方法有SVM和ANN。在样本设定上，我们可以选择全数据集训练+验证，也可以像某些文件中所做的那样，进行均衡化采样。
 
-All required experiment controls are centralized in `ham_pipeline/config.py` and used directly in runtime logic:
 
-1. Preprocessing on/off:
-   - `preprocessing_enabled`
-   - `enable_hair_removal`
-   - `enable_clahe`
-2. Feature participation:
-   - `include_lbp_roi`, `include_lbp_bimf1`, `include_glcm`, `include_hsv`, `include_abcd`
-3. Imbalance strategy:
-   - `imbalance_strategy`: `paper_balanced_subset | none | smote | smoteenn`
-4. Classifier choice:
-   - `model_name`: `svm | ann`
-5. Train/validation split:
-   - `split_mode`: `paper_fixed_count | stratified_ratio`
-   - `val_ratio` (used in `stratified_ratio`)
-   - `per_class_limit`, `train_per_class`, `val_per_class` (used in `paper_fixed_count`)
+## 技术细节
 
-## Structure
+本项目一个最大的障碍就是样本的**极不均衡**，nv占到全样本数的67%，这不利于样本的分类，但由于传统方法的上限就严重受限，其具体造成的影响水平也存疑。本项目中我们采用SMOTE及其衍生方法加以应对，也就是通过在已有的少数类样本之间进行“插值”，生成全新的、合成的少数类样本，这本质上是一种数据增强算法。
+
+### 特征选取
+
+1. GLCM: 着重提取ROI的纹理特征；
+2. LBP on ROI and BIMF1: 也是聚焦于纹理的特征；BIMF1是二维经验模态分解得到的第一个图层，包含了最为高频细致的成分，可以
+提升LBP（局部二值模式）的敏感度；
+3. HSV histogram: **色彩空间（Color Space）**特征，颜色直方图可以反映ROI的颜色倾向，这对应了医学上一些可解释的特征；
+4. ABCD: 不对称性、边缘不规则、颜色不均/多样性、直径大小，直接对应医学诊断流程。但是这些特征高度概括而主观，量化设计比较困难，
+尤其是直径大小难以直接量化，受拍摄条件和图像缩放影响。
+
+LBP和HSV都有一定抗亮度变化的能力。
+
+
+## 结果评估
+
+虽然在这个项目中，我们使用了很多的特征和方法，但并没有一种方法组合展现出明显的优越性。事实上，一些文献采用了均衡化子集的方式进行训练，声称取得了比较好的结果，但对于方法细节讲得并不算详细，实践上也难以复现。
+
+对于全数据集分类、验证任务，正确率大致在0.6-0.7之间；artifacts_*文件夹是结果输出，其中有混淆矩阵展示。ANN和SVM效果没有显著的差距，在目前的正确度水平下，这样的差距也缺乏意义。此外，对于数据集中的少数样本，分类器也很难建立足够的敏感性，即使是Smote及其衍生方法也没有完全解决这个问题。这和学术界目前的观点相符，也就是传统方法对于这类分类任务难有理想的效果。
+
+
+
+## 项目结构
 
 ```text
 HAM_10000_EVALUATE_refactored/
@@ -52,132 +53,5 @@ HAM_10000_EVALUATE_refactored/
     └── trainer.py
 ```
 
-## Dataset layout
 
-Expected under `--dataset-root`:
 
-```text
-HAM10000_metadata.csv
-HAM10000_images_part_1/
-HAM10000_images_part_2/
-```
-
-## Run
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-python main.py \
-  --dataset-root /path/to/HAM10000 \
-  --output-dir artifacts \
-  --image-size 160 \
-  --split-mode paper_fixed_count \
-  --per-class-limit 115 \
-  --train-per-class 70 \
-  --val-per-class 45 \
-  --imbalance-strategy paper_balanced_subset \
-  --model svm \
-  --svm-c 6.0 \
-  --svm-gamma scale \
-  --random-state 42 \
-  --n-jobs -1
-```
-
-Optional feature switches:
-
-- `--disable-glcm`
-- `--disable-hsv`
-- `--disable-abcd`
-- `--disable-lbp-roi`
-- `--disable-lbp-bimf1`
-
-Imbalance options:
-
-- `--imbalance-strategy paper_balanced_subset`
-- `--imbalance-strategy none`
-- `--imbalance-strategy smote`
-- `--imbalance-strategy smoteenn`
-
-Model options:
-
-- `--model svm`
-- `--model ann --ann-hidden 256,128 --ann-alpha 1e-4 --ann-max-iter 400`
-
-Paper-style replication preset:
-
-- `--paper-mode`
-
-This preset enforces: no hair removal, no CLAHE, only ROI/BIMF1 LBP features, balanced 115/class with 70/45 split, ANN classifier, and no SMOTE.
-
-Ratio split example:
-
-```bash
-python main.py \
-  --dataset-root /path/to/HAM10000 \
-  --output-dir artifacts_ratio \
-  --split-mode stratified_ratio \
-  --val-ratio 0.2 \
-  --imbalance-strategy smoteenn \
-  --model svm
-```
-
-Balanced-subset coverage over full HAM10000 (round-robin by class subset):
-
-```bash
-python main.py \
-  --dataset-root /path/to/HAM10000 \
-  --output-dir artifacts_coverage \
-  --split-mode paper_fixed_count \
-  --per-class-limit 115 \
-  --train-per-class 70 \
-  --val-per-class 45 \
-  --imbalance-strategy paper_balanced_subset \
-  --model ann \
-  --coverage-enabled \
-  --coverage-max-rounds 0
-```
-
-`coverage-max-rounds=0` means auto rounds until majority-class samples are covered.
-
-Enable posterior probabilities from SVM:
-
-- `--svm-probability`
-
-Note: when `--svm-probability` is enabled, SVC fits an extra Platt scaling stage, which increases training time and memory but allows `predict_proba` during inference.
-
-## Inference
-
-```bash
-python predict.py \
-  --artifacts-dir artifacts \
-  --image-path /path/to/sample.jpg
-```
-
-## Outputs
-
-- `artifacts/metrics.json`
-- `artifacts/confusion_matrix.png`
-- `artifacts/classification_report.csv`
-- `artifacts/model.joblib`
-- `artifacts/feature_columns.json`
-- `artifacts/label_classes.json` (when `--model ann`)
-- `artifacts/class_distribution_train.csv`
-- `artifacts/class_distribution_val.csv`
-- `artifacts/run_config.json`
-
-Coverage mode extra outputs (`coverage_enabled=true`):
-
-- `artifacts/round_*/` per-round metrics and models
-- `artifacts/coverage_metrics.csv`
-- `artifacts/coverage_summary.json`
-
-## Notes
-
-- There is no widely adopted Python package that exposes the exact Samsudin-style MREMD procedure directly; this repo implements that paper flow explicitly in `ham_pipeline/features.py`.
-- BIMF1 extraction follows the MREMD flow with fixed-window extrema envelopes and multiresolution downsampling/upsampling.
-- The default split follows the paper-style balanced protocol (70 train + 45 validation per class from up to 115 samples per class).
-- `paper_balanced_subset` follows the original paper's class-balancing spirit (equalized per-class subset before training).
-- If your accuracy is low on full-dataset settings, try `--paper-mode` first, then add extra feature groups one-by-one to check if they hurt performance.
-- This repository is for research and reproducibility, not clinical deployment.
