@@ -53,5 +53,70 @@ HAM_10000_EVALUATE_refactored/
     └── trainer.py
 ```
 
+## 输出结构
+
+每一轮测试分类都会产生一个`artifacts_*/`文件夹，其中单次测试的文件架构如下：
+
+```
+/artifacts_*/
+    ├── class_distribution_train.csv 训练集及其类型分布
+    ├── class_distribution_val.csv 测试集及其类型分布
+    ├── classification_report 结果报告，比较晦涩，不如混淆矩阵直观
+    ├── confusion_matrix.png 混淆矩阵（重点关注）
+    ├── feature_columns.json 用于分类的特征向量拼接结果
+    ├── feature_columns.json 标签分类
+    ├── metrics.json 评估参数，里面有准确度
+    ├── run_config 关键，有本次测试的一些选项
+    └── model.joblib 分类器的模型文件
+```
+
+### run_config.json
+
+```
+
+run_config.json 记录本次训练/评估的完整运行配置，常见字段含义如下：
+
+- dataset_root: 数据集根目录，如果用的是HAM10000_NOV就是前一位同学的Enhanced数据，HAM10000则是项目自己内置的raw_data；
+- output_dir: 输出目录
+- image_size: 输入图像缩放大小
+- val_ratio: 验证集比例（split_mode=stratified_ratio 时生效）
+- random_state: 随机种子，训练是随机抽取会用到
+- n_jobs: 并行度，性能问题，不用关注
+- cv_iter/cv_lambda1/cv_lambda2: Chan-Vese 分割迭代次数与权重，ROI。
+- clahe_clip_limit/clahe_tile_grid_size: CLAHE 参数 - 内置的预处理，已有预处理数据则跳过
+- blackhat_kernel_size/inpaint_radius: 去毛发参数 - 内置的预处理，已有预处理数据则跳过
+- preprocessing_enabled/enable_hair_removal/enable_clahe: 预处理开关，布尔变量
+- lbp_points/lbp_radius/lbp_method/lbp_bins: LBP 参数
+- include_lbp_roi/include_lbp_bimf1/include_glcm/include_hsv/include_abcd: 特征开关，这些特征可以选择是否参与
+- mremd_window_size/mremd_smoothing_kernel/mremd_max_bimfs: MREMD 参数，计算BIMF1会用到
+- hsv_bins/glcm_distances/glcm_angles: HSV/GLCM 参数
+- smote_k_neighbors/enn_k_neighbors/imbalance_strategy: 类不平衡策略参数
+- model_name/svm_c/svm_gamma/svm_probability: SVM 参数
+- ann_hidden_layer_sizes/ann_alpha/ann_max_iter: ANN 参数
+- split_mode/per_class_limit/train_per_class/val_per_class: 数据划分与每类样本数
+
+- coverage_enabled/coverage_max_rounds: coverage 多轮评估设置（会重复并训练多轮，避免偶然性）
+- two_stage_enabled/stage1_imbalance_strategy/stage2_imbalance_strategy: 两阶段训练设置（先粗分后细分，不必太关注，因为没有实质性改善，一般把nv mel和 其他先区分开再区分少数类，但事实证明这个设想难以实现）
+
+- threshold_tuning_enabled/threshold_search_min/threshold_search_max/threshold_search_steps: 阈值搜索配置(这是一个针对少数类进行优化的策略，机器学习中会用到)
+- minority_recall_floor/minority_classes: 少数类召回约束与类列表，直白地说就是哪些算是少数类是由这个参数定义的
+
+```
+
+### 运行实例
+artifacts_ann_all_features：ANN + 全特征方案，固定抽取均衡样本；
+artifacts_ann_full_dataset： 同上，全数据集分类、验证；
+artifacts_ann_paper_split: ANN，只使用LBP(BIMF1)+GCLM，固定抽取均衡样本；
+artifacts_ann_smote_texture：ANN，特征同上，全数据集，smote策略；
+artifacts_ann_texture_only：ANN，特征同上，全数据集，但是没有使用不均衡策略；
+artifacts_best_practice：下有ABCDEF 6个实验，主要是进行两步法测试，SVM全特征；A是对照组，BCDE都是两步分类，包括不均等策略调整和阈值搜索的一些参数阈值；这一部分比较复杂，有必要再补充（毕竟指标也没有很明显的提升）；
+artifacts_coverage：ANN 全特征，固定抽取均衡样本，反复多次测试，（59次），主要目的是复现所谓文献中训练子集的方法，结果不堪入目；
+artifacts_full：SVM带概率校正，全数据集全特征；
+artifacts_paper：ANN + LBP（BIMF1）only，是对提出这一方法文献的针对性复现尝试，但由于固定抽取均衡样本，结果不堪入目；
+artifacts_robust_svm：去除了HSV特征，适当提高svm_c的值；使用SVM分类
+artifacts_smoteenn_ann：ANN全特征，全样本分类，主要是引入了Smote-enn来应对样本不均衡性，但也没有明显改进；
+artifacts_svm_smote_hsv_nopre：全特征全样本SVM+Smote，跳过了预处理，用的raw data做分类的。吊诡的是，准确率反而高了——但是严重坍缩至nv，其实也算不上理想。
+
+
 
 
